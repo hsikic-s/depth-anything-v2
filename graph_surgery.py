@@ -7,7 +7,7 @@ import numpy as np
 import onnx
 import onnx.numpy_helper
 from numba.core.cgutils import printf
-from onnxsim import simplify
+from onnxsim import simplify as _onnxsim_simplify
 
 from onnx import helper, numpy_helper
 
@@ -17,6 +17,26 @@ import urllib
 import sys
 
 from sima_utils.onnx import onnx_helpers as oh
+
+# sima_utils still calls np.reshape(..., newshape=...), a keyword the SDK's NumPy 2.5 no longer accepts.
+_np_reshape = np.reshape
+np.reshape = lambda a, shape=None, *rest, newshape=None, **kwargs: _np_reshape(
+    a, shape if newshape is None else newshape, *rest, **kwargs)
+
+
+def simplify(model, **kwargs):
+    """onnxsim's simplify, returning the graph as sima_utils expects it.
+
+    onnxsim 0.8.1 adds metadata that differs between splits, and keeps constants shared by
+    blocks as Constant nodes; both stop the splits from merging.
+    """
+    model, check = _onnxsim_simplify(model, **kwargs)
+    del model.metadata_props[:]
+    for node in [n for n in model.graph.node if n.op_type == "Constant"]:
+        [value] = node.attribute
+        model.graph.initializer.append(numpy_helper.from_array(numpy_helper.to_array(value.t), node.output[0]))
+        model.graph.node.remove(node)
+    return model, check
 
 _MIDLE_BLOCKS = 3
 
@@ -38,8 +58,11 @@ _onnx_path = Path(_source_onnx_fname)
 
 simplified_fname = f"{args.model[:-5]}_simplified.onnx"
 
-model_to_be_simplified = oh.load_model(_source_onnx_fname)
-model_simp, check = simplify(model_to_be_simplified)
+model_to_be_simplified = oh.load_model(_source_onnx_fname, load_only=True)
+# Keep each Linear a named MatMul + Add: onnxsim 0.8.1 otherwise fuses them into unnamed Gemms,
+# and the rewrites below find them by name.
+model_simp, check = simplify(model_to_be_simplified, skipped_optimizers=[
+    "fuse_matmul_add_bias_into_gemm", "fuse_matmul_add_bias_into_gemm_batched"])
 
 assert check, "Simplified ONNX model could not be validated"
 
@@ -48,8 +71,11 @@ onnx.save(model_simp, simplified_fname)
 _source_onnx_fname = Path(args.model)
 _simplified_onnx_fname = Path(simplified_fname)
 
-# _input_shape = (1, 3, 518, 518)
-_input_shape = (1, 3, 518, 518)
+# A 640x480 frame resized as humanoid-stack's predictor_size does.
+_input_shape = (1, 3, 518, 686)
+# Grid of 14-pixel patches (37x49) and the tokens with the class token.
+_patch_h, _patch_w = _input_shape[2] // 14, _input_shape[3] // 14
+_tokens = _patch_h * _patch_w + 1
 _model_input_name = "input"
 _model_output_name = "output"
 
@@ -326,20 +352,18 @@ def _modify_preproc():
                 )
             )
 
-    # Update constants
-    # Class embedding: "/Expand_output_0", (1, 1, 384) -> (1, 1, 1, 384)
-    # Position embedding: "/Cast_output_0", (1, 257, 384) -> (1, 1, 257, 384)
+    # Update constants: the class token and position embedding taken by the Concat and Add,
+    # (1, N, 384) -> (1, 1, N, 384), whatever onnxsim named them
+    embeddings = {name for node in graph_def.node if node.name in ("/Concat", "/Add") for name in node.input}
     for initializer in list(initializers):
         if initializer.name in ["581"]:
             graph_def.initializer.remove(initializer)
-        elif initializer.name in ["/Expand_output_0", "/Cast_output_0"]:
-            data = onnx.numpy_helper.to_array(initializer)
-            # data = data.transpose([0, 2, 1])
-            data = np.expand_dims(data, axis=1)
+        elif initializer.name in embeddings:
+            data = np.expand_dims(onnx.numpy_helper.to_array(initializer), axis=1)
             initializer.CopyFrom(onnx.numpy_helper.from_array(data, initializer.name))
 
     # Update model output
-    oh.update_io_shape(model, "/Add_output_0", (1, 384, 1, 1370))
+    oh.update_io_shape(model, "/Add_output_0", (1, 384, 1, _tokens))
 
     # Remove existing shape inference results.
     for value_info in list(model.graph.value_info):
@@ -426,7 +450,7 @@ def _modify_attn_post(idx, model, transformer_blocks_attn, start):
 
     # Update I/O shape: (1, 257, 384) -> (1, 384, 1, 257)
     if idx_pos == 0:
-        oh.update_io_shape(model, transformer_blocks_attn[idx_pos].input_names[0], (1, 384, 1, 1370))
+        oh.update_io_shape(model, transformer_blocks_attn[idx_pos].input_names[0], (1, 384, 1, _tokens))
 
     # Update constants
     node = oh.find_node(model, f"/blocks.{idx}/attn/qkv/Add")
@@ -514,7 +538,7 @@ def _modify_postproc(k: int):
 
 
     # Update model input: (1, 257, 384) -> (1, 384, 1, 257)
-    oh.update_io_shape(model, _postproc_split.input_names[0], (1, 384, 1, 1370))
+    oh.update_io_shape(model, _postproc_split.input_names[0], (1, 384, 1, _tokens))
 
     # Insert transposes
     transpose_nodes = []
@@ -550,14 +574,14 @@ def _modify_postproc(k: int):
                 onnx.helper.make_tensor(slice_axes, onnx.TensorProto.INT64, [1], [2])
             )
             split_outputs = []
-            for h in range(37):
+            for h in range(_patch_h):
                 slice_starts = f"/depth_head/slice_{i}_{h}_starts"
                 slice_ends = f"/depth_head/slice_{i}_{h}_ends"
                 initializers.append(
-                    onnx.helper.make_tensor(slice_starts, onnx.TensorProto.INT64, [1], [h * 37])
+                    onnx.helper.make_tensor(slice_starts, onnx.TensorProto.INT64, [1], [h * _patch_w])
                 )
                 initializers.append(
-                    onnx.helper.make_tensor(slice_ends, onnx.TensorProto.INT64, [1], [(h + 1) * 37])
+                    onnx.helper.make_tensor(slice_ends, onnx.TensorProto.INT64, [1], [(h + 1) * _patch_w])
                 )
                 output = f"/depth_head/Slice_{i}_{h}"
                 slice_node = onnx.helper.make_node(
@@ -604,256 +628,17 @@ def _modify_postproc(k: int):
         model.graph.value_info.remove(value_info)
 
 
-    for initializer in model.graph.initializer:
-        if initializer.name == "/depth_head/refinenet4/Concat_output_0":
-            # Update the tensor values to [1, 128, 34, 34]
-            new_values = np.array([1, 64, 38, 38], dtype=np.int64)
-            new_tensor = numpy_helper.from_array(new_values, initializer.name)
-
-            # Replace the old initializer with the updated one
-            model.graph.initializer.remove(initializer)
-            model.graph.initializer.append(new_tensor)
-            break
-
-
-    # Update first Resize
-    initializers = model.graph.initializer
-
-    slice_axes_2 = "slice_axes_resize_2"
-    initializers.append(
-        onnx.helper.make_tensor(slice_axes_2, onnx.TensorProto.INT64, [1], [2])
-    )
-
-    slice_axes_3 = "slice_axes_resize_3"
-    initializers.append(
-        onnx.helper.make_tensor(slice_axes_3, onnx.TensorProto.INT64, [1], [3])
-    )
-
-    slice_starts_resize = "slice_starts_resize"
-    initializers.append(
-        onnx.helper.make_tensor(slice_starts_resize, onnx.TensorProto.INT64, [1], [1])
-    )
-
-    slice_step_resize = "slice_step_resize"
-    initializers.append(
-        onnx.helper.make_tensor(slice_step_resize, onnx.TensorProto.INT64, [1], [1])
-    )
-
-    slice_ends_int = "slice_ends_int"
-    initializers.append(
-        onnx.helper.make_tensor(slice_ends_int, onnx.TensorProto.INT64, [1], [38])
-    )
-
-    for node_idx, node in enumerate(model.graph.node):
-        if node.name == "/depth_head/refinenet4/Resize":
-            slice_node_1 = onnx.helper.make_node(
-                op_type="Slice",
-                name="/depth_head_refinenet4/Slice_1",
-                inputs=["/depth_head/refinenet4/Resize_output_0", slice_starts_resize,
-                        slice_ends_int, slice_axes_3, slice_step_resize],
-                outputs=["/depth_head_refinenet4/Resize/Slice_1_output"])
-            model.graph.node.insert(node_idx + 1, slice_node_1)
-
-            slice_node_2 = onnx.helper.make_node(
-                op_type="Slice",
-                name="/depth_head_refinenet4/Slice_2",
-                inputs=["/depth_head_refinenet4/Resize/Slice_1_output", slice_starts_resize,
-                        slice_ends_int, slice_axes_2, slice_step_resize],
-                outputs=["/depth_head_refinenet4/Resize/Slice_2_output"])
-            model.graph.node.insert(node_idx + 2, slice_node_2)
-
-    for i, node in enumerate(model.graph.node):
-        if node.name == "/depth_head/refinenet4/out_conv/Conv":
-            node.input[0] = "/depth_head_refinenet4/Resize/Slice_2_output"
-
-
-    # Update second Resize
-    for initializer in model.graph.initializer:
-        if initializer.name == "/depth_head/Concat_output_0":
-            # Update the tensor values to [1, 128, 34, 34]
-            new_values = np.array([1, 32, 592, 592], dtype=np.int64)
-            new_tensor = numpy_helper.from_array(new_values, initializer.name)
-
-            # Replace the old initializer with the updated one
-            model.graph.initializer.remove(initializer)
-            model.graph.initializer.append(new_tensor)
-            break
-
-
-    # Find the node index where the Resize operation is located
-    for node_idx, node in enumerate(model.graph.node):
-        if node.name == "/depth_head/Resize":
-            break
-
-    total_size = 592
-    target_size = _input_shape[2]
-
-    step = total_size / target_size
-
-    # Generate the indices that will be kept to reduce the size from 592 to 518
-    # Generate the indices that need to be removed to achieve the target size
-    all_indices = np.arange(total_size)
-    keep_indices = np.arange(0, total_size, step).astype(np.int64)
-    keep_indices = np.round(keep_indices).astype(np.int64)
-
-    rmv_indices = np.setdiff1d(all_indices, keep_indices)
-    rmv_indices = rmv_indices[k-1::k]
-
-    result = np.concatenate([rmv_index + np.arange(k) for rmv_index in rmv_indices])
-
-    keep_indices = np.setdiff1d(all_indices, result)
-
-
-    # Ensure there are exactly target_size elements
-    if len(keep_indices) > target_size:
-        keep_indices = keep_indices[:target_size]
-    elif len(keep_indices) < target_size:
-        keep_indices = np.append(keep_indices, total_size - 1)
-
-
-    # Find the missing indices
-    height_indices = np.setdiff1d(all_indices, keep_indices)
-    width_indices = height_indices  # Same for height and width
-
-    # Find the node index where the Resize operation is located
-    for node_idx, node in enumerate(model.graph.node):
-        if node.name == "/depth_head/Resize":
-            break
-
-    # Create and insert the Slice nodes for height dimension
-    height_slices = []
-    for i, index in enumerate(height_indices[::k]):
-        height_start_tmp = height_indices[k*i - 1] + 1 if i != 0 else 0
-        start_height = np.array([0, 0, height_start_tmp, 0], dtype=np.int64)
-
-        if i == 0:
-            height_end_tmp = height_indices[i]
-        else:
-            height_end_tmp = height_indices[k*i+1-1] if k*i < len(height_indices) - (k-1) else 592
-        end_height = np.array([1, 32, height_end_tmp, 592], dtype=np.int64)
-        axes = np.array([0, 1, 2, 3], dtype=np.int64)
-
-        start_height_tensor = numpy_helper.from_array(start_height, name=f'start_height_{i}')
-        end_height_tensor = numpy_helper.from_array(end_height, name=f'end_height_{i}')
-        axes_tensor = numpy_helper.from_array(axes, name=f'axes_{i}')
-
-        model.graph.initializer.append(start_height_tensor)
-        model.graph.initializer.append(end_height_tensor)
-        model.graph.initializer.append(axes_tensor)
-
-        slice_height_node = helper.make_node(
-            'Slice',
-            inputs=[node.output[0], f'start_height_{i}', f'end_height_{i}', f'axes_{i}'],
-            outputs=[f'sliced_height_{i}'],
-            name=f'slice_height_{i}'
-        )
-        model.graph.node.insert(node_idx + 1 + i, slice_height_node)
-        height_slices.append(f'sliced_height_{i}')
-
-    # Create the Concat node to merge height slices
-    concat_height_node = helper.make_node(
-        'Concat',
-        inputs=height_slices,
-        outputs=['concatenated_height'],
-        axis=2  # Assuming height slices are concatenated along height dimension
-    )
-    model.graph.node.insert(node_idx + 1 + int(np.ceil(len(height_indices) / k)), concat_height_node)
-
-    # Create and insert the Slice nodes for width dimension
-    width_slices = []
-    for i, index in enumerate(width_indices[::k]):
-        width_start_tmp = width_indices[k*i - 1] + 1 if i != 0 else 0
-        start_width = np.array([0, 0, 0, width_start_tmp], dtype=np.int64)
-        # width_end_tmp = width_indices[i] if i < len(width_indices) else 592
-
-        if i == 0:
-            width_end_tmp = width_indices[i]
-        else:
-            width_end_tmp = width_indices[k*i+1-1] if k*i < len(width_indices) - (k-1) else 592
-
-        end_width = np.array([1, 32, _input_shape[2], width_end_tmp], dtype=np.int64)
-        axes = np.array([0, 1, 2, 3], dtype=np.int64)
-
-        start_width_tensor = numpy_helper.from_array(start_width, name=f'start_width_{i}')
-        end_width_tensor = numpy_helper.from_array(end_width, name=f'end_width_{i}')
-        axes_tensor = numpy_helper.from_array(axes, name=f'axes_width_{i}')
-
-        model.graph.initializer.append(start_width_tensor)
-        model.graph.initializer.append(end_width_tensor)
-        model.graph.initializer.append(axes_tensor)
-
-        slice_width_node = helper.make_node(
-            'Slice',
-            inputs=['concatenated_height', f'start_width_{i}', f'end_width_{i}', f'axes_width_{i}'],
-            outputs=[f'sliced_width_{i}'],
-            name=f'slice_width_{i}'
-        )
-        model.graph.node.insert(node_idx + 2 + int(np.ceil(len(height_indices) / k)) + i, slice_width_node)
-        width_slices.append(f'sliced_width_{i}')
-
-    # Create the final Concat node to merge width slices
-    concat_width_node = helper.make_node(
-        'Concat',
-        inputs=width_slices,
-        outputs=['concatenated_width'],
-        axis=3  # Assuming width slices are concatenated along width dimension
-    )
-    model.graph.node.insert(node_idx + 2 + int(np.ceil(len(height_indices) / k)) + int(np.ceil(len(width_indices) / k)), concat_width_node)
-
-
-
-    for i, node in enumerate(model.graph.node):
-        if node.name == "/depth_head/output_conv2/output_conv2.0/Conv":
-            node.input[0] = "concatenated_width"
-            break
-
-    if val:
-        for i, node in enumerate(model.graph.node):
-            if node.name == "/Mul_1":
-                relu_node = node
-                node_idx = i
-                # node.output[0] = "output"
-            if node.name == "/Squeeze":
-                model.graph.node.remove(node)
-
-        model.graph.node.insert(
-            node_idx + 1,
-            onnx.helper.make_node(
-                op_type="Transpose",
-                name="Transpose",
-                inputs=relu_node.output,
-                outputs=["transposed_output"],
-                perm=(0, 2, 3, 1)
-            )
-        )
-
-    else:
-        for i, node in enumerate(model.graph.node):
-            if node.name == "/Relu":
-                relu_node = node
-                node_idx = i
-                # node.output[0] = "output"
-            if node.name == "/Squeeze":
-                model.graph.node.remove(node)
-
-        model.graph.node.insert(
-            node_idx + 1,
-            onnx.helper.make_node(
-                op_type="Transpose",
-                name="Transpose",
-                inputs=relu_node.output,
-                outputs=["transposed_output"],
-                perm=(0, 2, 3, 1)
-            )
-        )
-
-    output_shape = [1, 518, 518, 1]
-    output_type = onnx.TensorProto.FLOAT
-    output_name = "transposed_output"
-
-    output_proto = onnx.helper.make_tensor_value_info(output_name, output_type, output_shape)
+    # Keep the export's align_corners Resizes, which the MLA runs as they are, and drop the final
+    # Squeeze: a (1, 1, H, W) output comes off the board row by row.
+    last = "/Mul_1" if val else "/Relu"
+    for node in list(model.graph.node):
+        if node.name == last:
+            node.output[0] = "output"
+        elif node.name == "/Squeeze":
+            model.graph.node.remove(node)
     model.graph.output.pop(0)
-    model.graph.output.append(output_proto)
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("output", onnx.TensorProto.FLOAT, [1, 1, *_input_shape[2:]]))
 
 
     model, check = simplify(model)
@@ -870,13 +655,13 @@ def _modify_postproc(k: int):
 def _verify_opt_postproc(src_model, opt_model, input_names):
     # Input: (1, 257, 384) -> (1, 384, 1, 257)
     # Output: (1, 384) -> (1, 384, 1, 1)
-    orig_input = _generate_test_vector((1, 1370, 384))
-    opt_input = orig_input.transpose((0, 2, 1)).reshape(1, 384, 1, 1370)
+    orig_input = _generate_test_vector((1, _tokens, 384))
+    opt_input = orig_input.transpose((0, 2, 1)).reshape(1, 384, 1, _tokens)
 
     ref_outputs = oh.run_model(src_model, input_names, [orig_input])
     new_outputs = oh.run_model(opt_model, input_names, [opt_input])
 
-    diff = np.transpose(ref_outputs[0], (1, 2, 0)) - new_outputs[0]
+    diff = ref_outputs[0] - new_outputs[0][:, 0]
     print(f"Error: min = {np.min(diff)}, max = {np.max(diff)}")
 
 
@@ -954,8 +739,8 @@ def _modify_attn(idx):
     new_concat_nodes.append(new_node)
 
     # Update I/O shape: (1, 257, 384) -> (1, 384, 1, 257)
-    oh.update_io_shape(model, transformer_blocks_attn[idx].input_names[0], (1, 384, 1, 1370))
-    oh.update_io_shape(model, transformer_blocks_attn[idx].output_names[0], (1, 384, 1, 1370))
+    oh.update_io_shape(model, transformer_blocks_attn[idx].input_names[0], (1, 384, 1, _tokens))
+    oh.update_io_shape(model, transformer_blocks_attn[idx].output_names[0], (1, 384, 1, _tokens))
 
     # Update constants
     node = oh.find_node(model, f"/blocks.{idx}/attn/qkv/Add")
@@ -1022,8 +807,8 @@ def _modify_mlp(idx):
     new_conv_nodes = oh.rewrite_matmul_as_conv(model, at_nodes)
 
     # Update I/O shape: (1, 257, 384) -> (1, 384, 1, 257)
-    oh.update_io_shape(model, transformer_blocks_mlp[idx].input_names[0], (1, 384, 1, 1370))
-    oh.update_io_shape(model, transformer_blocks_mlp[idx].output_names[0], (1, 384, 1, 1370))
+    oh.update_io_shape(model, transformer_blocks_mlp[idx].input_names[0], (1, 384, 1, _tokens))
+    oh.update_io_shape(model, transformer_blocks_mlp[idx].output_names[0], (1, 384, 1, _tokens))
 
     # Update constants
     node = oh.find_node(model, f"/blocks.{idx}/mlp/fc1/Add")
@@ -1065,15 +850,15 @@ def _modify_mlp(idx):
 def _verify_opt_block(src_model, opt_model, input_names):
     # Input: (1, 257, 384) -> (1, 384, 1, 257)
     # Output: (1, 257, 384) -> (1, 384, 1, 257)
-    orig_input = _generate_test_vector((1, 1370, 384))
-    opt_input = orig_input.transpose((0, 2, 1)).reshape(1, 384, 1, 1370)
+    orig_input = _generate_test_vector((1, _tokens, 384))
+    opt_input = orig_input.transpose((0, 2, 1)).reshape(1, 384, 1, _tokens)
 
     ref_outputs = oh.run_model(src_model, input_names, [orig_input])
     new_outputs = oh.run_model(opt_model, input_names, [opt_input])
 
     opt_outputs = []
     for no in new_outputs:
-        t = no.reshape(1, 384, 1370)
+        t = no.reshape(1, 384, _tokens)
         t = t.transpose((0, 2, 1))
         opt_outputs.append(t)
 
@@ -1084,12 +869,12 @@ def _verify_opt_block(src_model, opt_model, input_names):
 
 
 def _verify_opt_whole_model(src_model, opt_model, input_names):
-    same_input = _generate_test_vector((1, 3, _input_shape[2], _input_shape[2]))
+    same_input = _generate_test_vector(_input_shape)
 
     ref_outputs = oh.run_model(src_model, input_names, [same_input])
     new_outputs = oh.run_model(opt_model, input_names, [same_input])
 
-    diff = np.transpose(ref_outputs[0], (1, 2, 0)) - new_outputs[0]
+    diff = ref_outputs[0] - new_outputs[0][:, 0]
     print(f"Error: min = {np.min(diff)}, max = {np.max(diff)}")
 
 
@@ -1201,21 +986,6 @@ def main(*, verify_simplified, split_top_level, split_transformer, verify_all_sp
 
         final_model_name = Path(args.model[:-5] + f"_opt.onnx")
 
-        # Resize attributes update to make it work on all SDK versions
-        for node in model.graph.node:
-            if node.op_type == "Resize":
-                found = False
-                # Check if the attribute already exists and update it
-                for attr in node.attribute:
-                    if attr.name == "coordinate_transformation_mode":
-                        attr.s = b"half_pixel"
-                        found = True
-                        break
-        
-        # If the attribute does not exist, create and append it
-        if not found:
-            new_attr = onnx.helper.make_attribute("coordinate_transformation_mode", "half_pixel")
-            node.attribute.append(new_attr)
         oh.save_model(model, final_model_name)
         print(f'ONNX file saved to {final_model_name}')
 

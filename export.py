@@ -18,6 +18,8 @@ parser = argparse.ArgumentParser(description='Depth Anything V2 Model exporting'
 
 parser.add_argument('--encoder', default='vits', choices=['vits', 'vitb', 'vitl', 'vitg'])
 parser.add_argument('--img_size', default=518, type=int)
+# 518x686: a 640x480 frame resized as humanoid-stack's predictor_size does.
+parser.add_argument('--img_width', default=686, type=int)
 parser.add_argument('--max-depth', default=20, type=float)
 parser.add_argument('--checkpoint', type=str, required=True)
 parser.add_argument('--port', default=None, type=int)
@@ -26,7 +28,7 @@ parser.add_argument('--port', default=None, type=int)
 def main():
     args = parser.parse_args()
 
-    warnings.simplefilter('ignore', np.RankWarning)
+    warnings.simplefilter('ignore', np.exceptions.RankWarning)
 
     logger = init_log('global', logging.INFO)
     logger.propagate = 0
@@ -49,7 +51,7 @@ def main():
     model.load_state_dict(torch.load(pth, map_location='cpu'))
     model.to(DEVICE).eval()
 
-    dummy_input = torch.randn(1, 3, args.img_size, args.img_size).to(DEVICE)
+    dummy_input = torch.randn(1, 3, args.img_size, args.img_width).to(DEVICE)
 
     output_path = f"depth_anything_v2_{args.encoder}"
 
